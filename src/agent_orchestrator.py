@@ -142,6 +142,7 @@ def _create_workflow_state(session_id: str, customer_id: str) -> dict:
         'created_at':  time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'version':     0,
         'ttl':         int(time.time()) + (24 * 3600),
+        'communication_completed': False,
     }
     table = dynamodb.Table(config.WORKFLOW_STATE_TABLE)
     table.put_item(
@@ -739,20 +740,23 @@ def build_orchestrator_agent(
         region_name=config.AWS_REGION,
         temperature=0.0,
     )
+    orchestrator_ref: dict[str, Agent] = {}
     system_prompt = (
         "You are NovaMart's request orchestrator. Determine intent and use the "
-        "tools in the required order. For every request, call initialize_session "
-        "first. For order status/history questions, call route_to_inventory_agent. "
-        "For return/refund requests, call route_to_inventory_agent and then "
-        "route_to_refund_agent. For return, shipping, or warranty policy meaning "
-        "questions, call route_to_policy_agent. For account/tier questions, call "
-        "route_to_inventory_agent, never the policy agent. For simple math, do not "
-        "call a specialist worker. For every request, call "
-        "route_to_communication_agent as your final tool action. After that tool "
-        "returns, stop immediately and make no more tool calls. You only coordinate "
-        "tools: never draft, paraphrase, or write the customer-facing response. "
-        "Return exactly the Communication Agent's result. Use the session and "
-        "customer IDs provided in the incoming message."
+        "tools in this exact sequence. First call initialize_session and wait for "
+        "its successful result before calling any other tool. For order "
+        "status/history questions, call route_to_inventory_agent once. For "
+        "return/refund requests, call route_to_inventory_agent once, then "
+        "route_to_refund_agent once. For return, shipping, or warranty policy "
+        "questions, call route_to_policy_agent once. For account/tier questions, "
+        "call route_to_inventory_agent once, never the policy agent. For simple "
+        "math, call no specialist worker; pass the original question to "
+        "route_to_communication_agent to calculate and compose the answer. After "
+        "all required specialists finish, call route_to_communication_agent "
+        "exactly once as the final tool call. Never retry a successful tool call. "
+        "After the communication tool returns, stop immediately. You only "
+        "coordinate tools: do not calculate, answer, draft, paraphrase, or write "
+        "customer-facing text. Use the session and customer IDs from the request."
     )
 
     def _require_session(session_id: str, customer_id: Optional[str] = None) -> dict:
@@ -763,6 +767,11 @@ def build_orchestrator_agent(
             raise ValueError("Workflow session is missing; initialize it first.")
         if customer_id and state.get('customer_id') != customer_id:
             raise ValueError("The session does not belong to the supplied customer.")
+        if state.get('communication_completed'):
+            raise ValueError(
+                "The Communication Agent has completed the response; no more "
+                "routing tools may run for this request."
+            )
         return state
 
     @tool
@@ -878,10 +887,14 @@ def build_orchestrator_agent(
         ))
         _update_workflow_state(
             session_id,
-            {'communication_agent': result},
+            {
+                'communication_agent': result,
+                'communication_completed': True,
+            },
             expected_version=old_version,
         )
         trace.step_done('communication_agent', old_version)
+        orchestrator_ref['agent'].cancel()
         return result
 
     @tool
@@ -903,6 +916,12 @@ def build_orchestrator_agent(
         if current:
             if current.get('customer_id') != customer_id:
                 raise ValueError("The session already belongs to a different customer.")
+            if current.get('communication_completed'):
+                _update_workflow_state(
+                    session_id,
+                    {'communication_completed': False},
+                    expected_version=int(current['version']),
+                )
             return f"Session {session_id} is already initialized."
         try:
             _create_workflow_state(session_id, customer_id)
@@ -913,7 +932,7 @@ def build_orchestrator_agent(
             return f"Session {session_id} is already initialized."
         return f"Session {session_id} initialized for customer {customer_id}."
 
-    return Agent(
+    orchestrator = Agent(
         model=model,
         system_prompt=system_prompt,
         tools=[
@@ -924,6 +943,8 @@ def build_orchestrator_agent(
             route_to_communication_agent,
         ],
     )
+    orchestrator_ref['agent'] = orchestrator
+    return orchestrator
 
 
 # ═══════════════════════════════════════════════════════
