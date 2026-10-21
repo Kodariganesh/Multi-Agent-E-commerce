@@ -268,7 +268,7 @@ class AgentTrace:
                      f"{_C.GRY}Routing request to specialist agents...{_C.RESET}")
         _trace_print(f"  {_C.GRY}Model : {config.ORCHESTRATOR_MODEL_ID}{_C.RESET}")
         _trace_print(f"  {_C.GRY}{'=' * w}{_C.RESET}")
-        _trace_print(f"  {_C.GRY}  [AGENT REASONING - ORCHESTRATOR]{_C.RESET}")
+        _trace_print(f"  {_C.GRY}  [ORCHESTRATOR - DETERMINISTIC ROUTING]{_C.RESET}")
 
     def summary(self, session_id: str, elapsed: float) -> None:
         """

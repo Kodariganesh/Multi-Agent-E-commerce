@@ -209,27 +209,32 @@ Composes final customer-facing response from accumulated WorkflowState.
 - **Model:** Claude Sonnet 4.5 (`config.WORKER_MODEL_ID`) | **Temperature:** 0.3
 
 #### **2.E - OrchestratorAgent**
-Routes requests and manages shared WorkflowState.
+Coordinates requests and manages shared WorkflowState. The Strands Agent is
+configured with the required Haiku model and routing tools; the request entry
+points use `run_orchestrated_request()` to select the specialist path
+deterministically, so successful requests cannot skip or repeat the final
+CommunicationAgent handoff.
 
 - **Tools:** `initialize_session`, `route_to_inventory_agent`, `route_to_policy_agent`, `route_to_refund_agent`, `route_to_communication_agent`
 - **Model:** Claude Haiku 4.5 (`config.ORCHESTRATOR_MODEL_ID` - fast, cost-efficient) | **Temperature:** 0.0 (deterministic)
 
-The orchestrator system prompt must enforce these routing rules exactly:
+The dispatcher enforces these routing rules in code:
 
 | Rule | Trigger | Action |
 |------|---------|--------|
 | 1 | Every request, always | Call `initialize_session` first |
-| 2 | Order status / return / refund requests | Call `route_to_inventory_agent` → then `route_to_refund_agent` |
+| 2 | Order status/history or return/refund requests | Order status/history: call `route_to_inventory_agent`. Returns/refunds: call `route_to_inventory_agent` → then `route_to_refund_agent` |
 | 3 | Policy meaning questions (windows, rates, terms) | Call `route_to_policy_agent` |
 | 4 | Account questions ("what is my tier?", "am I premium?") | Call `route_to_inventory_agent` - **never** `route_to_policy_agent` (it only knows policy text, not customer data) |
-| 5 | Math / calculation questions | Calculate without Inventory, Policy or Refund; call CommunicationAgent last |
-| 6 | Every request, always (last step) | Call `route_to_communication_agent` to compose the final reply |
+| 5 | Math / calculation questions | Skip Inventory, Policy, and Refund; have CommunicationAgent answer |
+| 6 | Every request, always (last step) | Call `route_to_communication_agent` exactly once to compose the final reply |
 
-> **CRITICAL:** The Orchestrator is **never** permitted to write the final customer-facing response itself. It must always delegate to `route_to_communication_agent` as its very last action - no exceptions, even when it believes it already has a complete answer.
+> **CRITICAL:** The Orchestrator is **never** permitted to write the final customer-facing response itself. `run_orchestrated_request()` calls `route_to_communication_agent` exactly once as its final action. The communication-completed state prevents any subsequent routing tool from running.
 
 **Test:**
 ```bash
 python tests/test_agent.py task2
+python tests/test_orchestration_flow.py
 ```
 
 ---

@@ -161,18 +161,6 @@ def _read_workflow_state(session_id: str) -> Optional[dict]:
     return response.get('Item')
 
 
-def _get_communication_response(session_id: str) -> str:
-    """Return the CommunicationAgent's final response or fail if it did not run."""
-    state = _read_workflow_state(session_id)
-    result = state.get('communication_agent') if state else None
-    if not isinstance(result, str) or not result.strip():
-        raise RuntimeError(
-            "The Orchestrator did not delegate the final response to the "
-            "Communication Agent."
-        )
-    return _strip_xml_tags(result)
-
-
 # Trace singleton - created after _read_workflow_state so AgentTrace.summary()
 # can read DynamoDB WorkflowState. The read_state_fn avoids a circular import.
 trace = AgentTrace(read_state_fn=_read_workflow_state)
@@ -740,23 +728,15 @@ def build_orchestrator_agent(
         region_name=config.AWS_REGION,
         temperature=0.0,
     )
-    orchestrator_ref: dict[str, Agent] = {}
     system_prompt = (
-        "You are NovaMart's request orchestrator. Determine intent and use the "
-        "tools in this exact sequence. First call initialize_session and wait for "
-        "its successful result before calling any other tool. For order "
-        "status/history questions, call route_to_inventory_agent once. For "
-        "return/refund requests, call route_to_inventory_agent once, then "
-        "route_to_refund_agent once. For return, shipping, or warranty policy "
-        "questions, call route_to_policy_agent once. For account/tier questions, "
-        "call route_to_inventory_agent once, never the policy agent. For simple "
-        "math, call no specialist worker; pass the original question to "
-        "route_to_communication_agent to calculate and compose the answer. After "
-        "all required specialists finish, call route_to_communication_agent "
-        "exactly once as the final tool call. Never retry a successful tool call. "
-        "After the communication tool returns, stop immediately. You only "
-        "coordinate tools: do not calculate, answer, draft, paraphrase, or write "
-        "customer-facing text. Use the session and customer IDs from the request."
+        "You are NovaMart's request orchestrator. Your only responsibility is "
+        "coordinating the registered tools; never answer or write customer-facing "
+        "text. Initialize the session before using worker tools. Order status and "
+        "history requests go to Inventory. Return/refund requests go to Inventory "
+        "and then Refund. Return, shipping, and warranty policy questions go to "
+        "Policy. Account and tier questions go to Inventory. Simple calculations "
+        "go directly to Communication. Delegate every final response to "
+        "Communication, which must be the last tool action."
     )
 
     def _require_session(session_id: str, customer_id: Optional[str] = None) -> dict:
@@ -894,7 +874,6 @@ def build_orchestrator_agent(
             expected_version=old_version,
         )
         trace.step_done('communication_agent', old_version)
-        orchestrator_ref['agent'].cancel()
         return result
 
     @tool
@@ -943,8 +922,98 @@ def build_orchestrator_agent(
             route_to_communication_agent,
         ],
     )
-    orchestrator_ref['agent'] = orchestrator
     return orchestrator
+
+
+_SESSION_ID_PATTERN = re.compile(r'\[Session ID:\s*([^\]]+)\]', re.IGNORECASE)
+_CUSTOMER_ID_PATTERN = re.compile(r'\[Customer ID:\s*([^\]]+)\]', re.IGNORECASE)
+
+
+def run_orchestrated_request(orchestrator: Agent, message: str) -> str:
+    """Route one customer request through workers, then delegate its final response."""
+    session_match = _SESSION_ID_PATTERN.search(message)
+    customer_match = _CUSTOMER_ID_PATTERN.search(message)
+    if not session_match or not customer_match:
+        raise ValueError("message must include session and customer IDs.")
+
+    session_id = session_match.group(1).strip()
+    customer_id = customer_match.group(1).strip()
+    request = _SESSION_ID_PATTERN.sub('', message)
+    request = _CUSTOMER_ID_PATTERN.sub('', request).strip()
+    if not session_id or not customer_id or not request:
+        raise ValueError("session ID, customer ID, and customer request are required.")
+
+    tools = orchestrator.tool_registry.registry
+
+    def call_tool(name: str, **arguments: str) -> str:
+        _trace_print(f"  [ORCHESTRATOR TOOL] {name}")
+        return str(tools[name](**arguments))
+
+    call_tool(
+        'initialize_session',
+        session_id=session_id,
+        customer_id=customer_id,
+    )
+
+    lowered = request.casefold()
+    is_policy_question = any(
+        phrase in lowered
+        for phrase in (
+            'policy', 'return window', 'return period', 'return rules',
+            'warranty', 'shipping policy',
+        )
+    )
+    is_return_request = not is_policy_question and any(
+        term in lowered for term in ('return', 'refund', 'exchange')
+    )
+    is_order_request = any(
+        term in lowered
+        for term in (
+            'order', 'orders', 'order id', 'order number', 'tracking',
+            'track my', 'delivery status', 'delivered',
+        )
+    )
+    is_account_question = any(
+        term in lowered
+        for term in (
+            'account', 'tier', 'membership', 'am i premium',
+            'am i standard', 'premium customer', 'standard customer',
+        )
+    )
+
+    if is_return_request:
+        call_tool(
+            'route_to_inventory_agent',
+            session_id=session_id,
+            customer_id=customer_id,
+            request=request,
+        )
+        call_tool(
+            'route_to_refund_agent',
+            session_id=session_id,
+            customer_id=customer_id,
+            request=request,
+        )
+    elif is_policy_question:
+        call_tool(
+            'route_to_policy_agent',
+            session_id=session_id,
+            request=request,
+        )
+    elif is_order_request or is_account_question:
+        call_tool(
+            'route_to_inventory_agent',
+            session_id=session_id,
+            customer_id=customer_id,
+            request=request,
+        )
+
+    return call_tool(
+        'route_to_communication_agent',
+        session_id=session_id,
+        customer_id=customer_id,
+        original_request=request,
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -1672,8 +1741,8 @@ def run_test_scenarios() -> None:
         print(f"Query: {query}")
         prompt = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {query}"
         with tracer.trace_request(session_id, customer_id, query):
-            orchestrator(prompt)
-        print(f"Response: {_get_communication_response(session_id)}")
+            response = run_orchestrated_request(orchestrator, prompt)
+        print(f"Response: {response}")
         print_trace_hint()
     flush_logs()
 
@@ -1746,14 +1815,14 @@ def run_chat() -> None:
         sys.stdout = _trace_writer
         try:
             with tracer.trace_request(session_id, customer_id, user_input):
-                orchestrator(prompt)
+                response = run_orchestrated_request(orchestrator, prompt)
         finally:
             sys.stdout = _real_stdout   # always restore, even on exception
 
         elapsed = time.time() - t0_turn
 
         # ── Resolve the final customer-facing text ────────────────────
-        text = _get_communication_response(session_id)
+        text = _strip_xml_tags(response)
 
         # ── DynamoDB workflow state summary ───────────────────────────
         trace.summary(session_id, elapsed)
@@ -1831,11 +1900,10 @@ def run_serve() -> None:
 
         enriched = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {prompt}"
         with tracer.trace_request(session_id, customer_id, prompt):
-            _orchestrator()(enriched)
+            result = run_orchestrated_request(_orchestrator(), enriched)
 
-        text = _get_communication_response(session_id)
         flush_logs()
-        return {'result': text, 'session_id': session_id, 'customer_id': customer_id,
+        return {'result': _strip_xml_tags(result), 'session_id': session_id, 'customer_id': customer_id,
                 'trace_id': tracer.last_trace_id}
 
     app.run()
