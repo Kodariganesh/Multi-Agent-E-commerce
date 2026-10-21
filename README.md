@@ -131,6 +131,7 @@ starter/
 │
 ├── config.py                              # Central configuration (reads CloudFormation exports + env vars)
 ├── requirements.txt                       # Python dependencies
+├── .env                                    # Evaluation resource configuration (no AWS credentials)
 ├── .env.example                           # Environment variable template
 ├── README.md                              # This file
 │

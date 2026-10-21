@@ -18,7 +18,7 @@ from agent_utils import _trace_writer, _real_stdout, _strip_xml_tags
 from agent_observability import tracer, setup_logging, print_trace_hint, flush_logs
 from agent_orchestrator import (
     build_agent_graph,
-    _read_workflow_state,
+    _get_communication_response,
     trace,
 )
 
@@ -51,7 +51,7 @@ trace.new_turn()
 sys.stdout = _trace_writer
 try:
     with tracer.trace_request(session_id, CUSTOMER_ID, QUERY):
-        response = orchestrator(prompt)
+        orchestrator(prompt)
 finally:
     sys.stdout = _real_stdout   # always restore, even on exception
 
@@ -60,9 +60,7 @@ finally:
 import time
 trace.summary(session_id, elapsed=0)
 
-state       = _read_workflow_state(session_id) or {}
-comm_result = state.get('communication_agent', '')
-text        = _strip_xml_tags(comm_result or str(response))
+text = _get_communication_response(session_id)
 
 print(f"\n{'=' * 68}")
 print("  AGENT RESPONSE")

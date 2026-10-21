@@ -160,6 +160,18 @@ def _read_workflow_state(session_id: str) -> Optional[dict]:
     return response.get('Item')
 
 
+def _get_communication_response(session_id: str) -> str:
+    """Return the CommunicationAgent's final response or fail if it did not run."""
+    state = _read_workflow_state(session_id)
+    result = state.get('communication_agent') if state else None
+    if not isinstance(result, str) or not result.strip():
+        raise RuntimeError(
+            "The Orchestrator did not delegate the final response to the "
+            "Communication Agent."
+        )
+    return _strip_xml_tags(result)
+
+
 # Trace singleton - created after _read_workflow_state so AgentTrace.summary()
 # can read DynamoDB WorkflowState. The read_state_fn avoids a circular import.
 trace = AgentTrace(read_state_fn=_read_workflow_state)
@@ -736,9 +748,11 @@ def build_orchestrator_agent(
         "questions, call route_to_policy_agent. For account/tier questions, call "
         "route_to_inventory_agent, never the policy agent. For simple math, do not "
         "call a specialist worker. For every request, call "
-        "route_to_communication_agent as your final tool action. Never write the "
-        "customer-facing response yourself. Use the session and customer IDs "
-        "provided in the incoming message."
+        "route_to_communication_agent as your final tool action. After that tool "
+        "returns, stop immediately and make no more tool calls. You only coordinate "
+        "tools: never draft, paraphrase, or write the customer-facing response. "
+        "Return exactly the Communication Agent's result. Use the session and "
+        "customer IDs provided in the incoming message."
     )
 
     def _require_session(session_id: str, customer_id: Optional[str] = None) -> dict:
@@ -1637,8 +1651,8 @@ def run_test_scenarios() -> None:
         print(f"Query: {query}")
         prompt = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {query}"
         with tracer.trace_request(session_id, customer_id, query):
-            response = orchestrator(prompt)
-        print(f"Response: {response}")
+            orchestrator(prompt)
+        print(f"Response: {_get_communication_response(session_id)}")
         print_trace_hint()
     flush_logs()
 
@@ -1711,16 +1725,14 @@ def run_chat() -> None:
         sys.stdout = _trace_writer
         try:
             with tracer.trace_request(session_id, customer_id, user_input):
-                response = orchestrator(prompt)
+                orchestrator(prompt)
         finally:
             sys.stdout = _real_stdout   # always restore, even on exception
 
         elapsed = time.time() - t0_turn
 
         # ── Resolve the final customer-facing text ────────────────────
-        final_state = _read_workflow_state(session_id) or {}
-        comm_result = final_state.get('communication_agent', '')
-        text = _strip_xml_tags(comm_result or str(response))
+        text = _get_communication_response(session_id)
 
         # ── DynamoDB workflow state summary ───────────────────────────
         trace.summary(session_id, elapsed)
@@ -1798,10 +1810,9 @@ def run_serve() -> None:
 
         enriched = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {prompt}"
         with tracer.trace_request(session_id, customer_id, prompt):
-            response = _orchestrator()(enriched)
+            _orchestrator()(enriched)
 
-        state = _read_workflow_state(session_id) or {}
-        text  = _strip_xml_tags(state.get('communication_agent', '') or str(response))
+        text = _get_communication_response(session_id)
         flush_logs()
         return {'result': text, 'session_id': session_id, 'customer_id': customer_id,
                 'trace_id': tracer.last_trace_id}
